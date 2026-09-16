@@ -124,9 +124,9 @@ pub const Handler = struct {
         desktop_notification: ?*const fn (*Handler, Action.ShowDesktopNotification) void,
 
         /// Called when drag and drop protocol state changes in a way the
-        /// embedder may need to act on: the running program registering
-        /// or unregistering to accept drops, answering a drag, or
-        /// concluding a drop. The event says what changed; the details
+        /// embedder may need to act on: the running program changing
+        /// drop-target or drag-source state, answering a drag, providing
+        /// source data, or concluding a drop. The event says what changed; the details
         /// are read from `handler.terminal.kitty_dnd` (Kitty's OSC 72 is
         /// the only drag and drop protocol today). Native drag events
         /// flow the other way, by calling `kitty.dnd.State` directly.

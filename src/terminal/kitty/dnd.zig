@@ -26,12 +26,6 @@
 //!     keys) are answered with EINVAL. A remote client (e.g. over
 //!     ssh) can still receive text drops; only file-content transfer
 //!     is unavailable.
-//!   * The terminal never initiates drags (drag out): enabling and
-//!     disabling offers (t=o:x=1, t=o:x=2) are accepted and ignored,
-//!     and since the terminal never sends a drag start request a
-//!     conforming client never offers a drag. Direct offers (t=o:x=0)
-//!     and drag data/start commands (t=p, t=P) are refused with EPERM.
-//!
 //! These are on purpose forever:
 //!
 //!   * Responses echo the requesting command's terminator (ST or BEL)
@@ -58,6 +52,8 @@ pub const State = dnd_drop.State;
 pub const Item = dnd_drop.State.Item;
 pub const MoveEvent = dnd_drop.State.MoveEvent;
 pub const max_mime_list_bytes = dnd_drop.max_mime_list_bytes;
+pub const max_source_mimes = dnd_drop.max_source_mimes;
+pub const max_source_data_bytes = dnd_drop.max_source_data_bytes;
 pub const handleCommand = dnd_drop.handleCommand;
 pub const Event = dnd_drop.Event;
 

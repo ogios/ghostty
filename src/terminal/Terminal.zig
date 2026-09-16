@@ -92,9 +92,9 @@ mouse_shape: mouse.Shape = .text,
 glyph_glossary: glyph.Glossary = .empty,
 
 /// Kitty drag and drop protocol (OSC 72) state. Allocated when a client
-/// registers to accept drops (t=a) and freed when it unregisters (t=A),
-/// so a terminal that never runs a drag and drop aware program pays
-/// nothing for it. Non-null means a client currently accepts drops.
+/// registers as a drop target (t=a) or drag source (t=o:x=1), and freed
+/// after it unregisters both capabilities, so a terminal that never runs
+/// a drag and drop aware program pays nothing for it.
 kitty_dnd: ?*kitty.dnd.State = null,
 
 /// These are just a packed set of flags we may set on the terminal.

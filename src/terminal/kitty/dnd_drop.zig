@@ -17,6 +17,8 @@ const log = std.log.scoped(.kitty_dnd);
 /// Maximum accumulated size of a client-sent MIME list (the accepted
 /// list of a `t=m` status update). Matches kitty's MIME_LIST_SIZE_CAP.
 pub const max_mime_list_bytes = 1024 * 1024;
+pub const max_source_mimes = 256;
+pub const max_source_data_bytes = 64 * 1024 * 1024;
 
 /// Process one OSC 72 command received from the client, writing any
 /// responses to the writer. Returns the state change the embedder may
@@ -68,13 +70,17 @@ pub fn handleCommand(
 
         .unregister => {
             const state = slot.* orelse return null;
-            state.destroy(alloc);
-            slot.* = null;
+            state.unregisterDrop(alloc);
+            if (!state.source.enabled) {
+                state.destroy(alloc);
+                slot.* = null;
+            }
             return .registration;
         },
 
         .status => {
             const state = slot.* orelse return null;
+            if (!state.drop.registered) return null;
             return try state.acceptStatus(alloc, meta, payload);
         },
 
@@ -86,28 +92,66 @@ pub fn handleCommand(
             v.terminator,
         ),
 
-        // Drag source control. Enabling (x=1, with an optional
-        // machine ID payload) and disabling (x=2) offers are
-        // accepted and ignored since the terminal never requests a
-        // drag start. Offering a MIME list (x=0) for a new drag is
-        // refused since drag-out is not implemented.
-        .offer => if (meta.cell_x == 0) try refuseDragOut(
-            writer,
-            meta,
-            v.terminator,
-        ),
+        .offer => switch (meta.cell_x) {
+            1 => {
+                const state = slot.* orelse state: {
+                    const state = try State.create(alloc);
+                    slot.* = state;
+                    _ = state.chunking.apply(raw);
+                    break :state state;
+                };
+                state.enableSource(alloc, meta.client_id);
+                return .source_registration;
+            },
+            2 => {
+                const state = slot.* orelse return null;
+                state.disableSource(alloc);
+                if (!state.drop.registered) {
+                    state.destroy(alloc);
+                    slot.* = null;
+                }
+                return .source_registration;
+            },
+            0 => {
+                const state = slot.* orelse {
+                    try dragError(writer, meta.client_id, .EPERM, "drag gesture is no longer active", v.terminator);
+                    return null;
+                };
+                return try state.acceptSourceOffer(alloc, writer, meta, payload, continuation, v.terminator);
+            },
+            else => {},
+        },
 
-        // Drag-out data and start commands. A conforming client
-        // never sends these because the terminal never requests a
-        // drag start, but refuse them properly if one does.
-        .present, .start_drag => try refuseDragOut(
-            writer,
-            meta,
-            v.terminator,
-        ),
+        .present => {
+            const state = slot.* orelse {
+                try dragError(writer, meta.client_id, .EINVAL, "no drag offer is active", v.terminator);
+                return null;
+            };
+            return try state.acceptSourceData(alloc, writer, meta, payload, continuation, false, v.terminator);
+        },
 
-        // Responses to drag-out requests the terminal never makes.
-        .drag_event, .drag_error, .remote_data => {},
+        .start_drag => {
+            const state = slot.* orelse {
+                try dragError(writer, meta.client_id, .EPERM, "drag gesture is no longer active", v.terminator);
+                return null;
+            };
+            if (meta.cell_x == -1) return try state.requestSourceStart(writer, v.terminator);
+        },
+
+        .drag_event => {
+            const state = slot.* orelse {
+                try dragError(writer, meta.client_id, .EINVAL, "no drag is active", v.terminator);
+                return null;
+            };
+            return try state.acceptSourceData(alloc, writer, meta, payload, continuation, true, v.terminator);
+        },
+
+        .drag_error => {
+            const state = slot.* orelse return null;
+            return try state.acceptSourceError(alloc, writer, meta, v.terminator);
+        },
+
+        .remote_data => {},
 
         .query => try response.encode(
             writer,
@@ -228,22 +272,14 @@ fn dataRequest(
     return null;
 }
 
-/// Refuse a drag-out command with an error, since ghostty does not
-/// implement the terminal side of client-initiated drags yet.
-fn refuseDragOut(
+fn dragError(
     writer: *std.Io.Writer,
-    meta: Metadata,
+    client_id: u32,
+    errno: response.Errno,
+    description: []const u8,
     terminator: osc.Terminator,
 ) std.Io.Writer.Error!void {
-    try response.encodeError(
-        writer,
-        .drag,
-        .{},
-        meta.client_id,
-        .EPERM,
-        "drag out is not supported by this terminal",
-        terminator,
-    );
+    try response.encodeError(writer, .drag, .{}, client_id, errno, description, terminator);
 }
 
 /// A protocol state change an embedder may need to act on, returned by
@@ -267,6 +303,12 @@ pub const Event = enum {
     concluded_none,
     concluded_copy,
     concluded_move,
+    source_registration,
+    source_offer,
+    source_start,
+    source_data,
+    source_data_error,
+    source_cancel,
 
     /// The conclusion event for a performed operation.
     pub fn concluded(op: Operation) Event {
@@ -278,7 +320,7 @@ pub const Event = enum {
     }
 };
 
-/// The per-terminal drop target state.
+/// The per-terminal drag-and-drop state.
 ///
 /// The primary entrypoint is `handleCommand` which takes a `*?*State`
 /// slot that it can heap allocate into when DnD activates and free when
@@ -326,8 +368,11 @@ pub const State = struct {
 
     /// Drop target state for the registered client.
     drop: DropTarget = .{},
+    source: DragSource = .{},
 
     pub const DropTarget = struct {
+        registered: bool = false,
+
         /// Multiplexer client ID from registration, echoed in every
         /// drop-side message the terminal sends.
         client_id: u32 = 0,
@@ -363,6 +408,51 @@ pub const State = struct {
 
         /// The data captured at drop time, parallel to `offered`.
         items: ?[]const Item = null,
+    };
+
+    pub const DragSource = struct {
+        enabled: bool = false,
+        client_id: u32 = 0,
+        phase: Phase = .idle,
+        operations: Operations = .{},
+        mime_list: std.ArrayListUnmanaged(u8) = .empty,
+        mimes: std.ArrayListUnmanaged(Mime) = .empty,
+        ready_index: ?usize = null,
+        total_data_bytes: usize = 0,
+
+        const Phase = enum { idle, requested, offered, started };
+
+        const Mime = struct {
+            name: []u8,
+            data: std.ArrayListUnmanaged(u8) = .empty,
+            complete: bool = false,
+            requested: bool = false,
+            /// Data for different MIME requests can arrive in any order.
+            receiving: bool = false,
+        };
+
+        fn resetOffer(self: *DragSource, alloc: Allocator) void {
+            for (self.mimes.items) |*mime| {
+                alloc.free(mime.name);
+                mime.data.deinit(alloc);
+            }
+            self.mimes.deinit(alloc);
+            self.mimes = .empty;
+            self.mime_list.clearAndFree(alloc);
+            self.phase = .idle;
+            self.operations = .{};
+            self.ready_index = null;
+            self.total_data_bytes = 0;
+        }
+
+        fn deinit(self: *DragSource, alloc: Allocator) void {
+            self.resetOffer(alloc);
+        }
+    };
+
+    pub const SourceOffer = struct {
+        operations: Operations,
+        mime_count: usize,
     };
 
     /// One dropped representation: a MIME type and its data.
@@ -435,6 +525,18 @@ pub const State = struct {
         self.freeDragData(alloc);
         self.drop.accepted_mimes.deinit(alloc);
         self.drop.registered_mimes.deinit(alloc);
+        self.source.deinit(alloc);
+    }
+
+    pub fn dropRegistered(self: *const State) bool {
+        return self.drop.registered;
+    }
+
+    fn unregisterDrop(self: *State, alloc: Allocator) void {
+        self.resetDrop(alloc);
+        self.drop.registered_mimes.clearAndFree(alloc);
+        self.drop.registered = false;
+        self.drop.client_id = 0;
     }
 
     /// Iterate the MIME types the client registered with, in order.
@@ -461,6 +563,7 @@ pub const State = struct {
         more: bool,
     ) Allocator.Error!?Event {
         const list = &self.drop.registered_mimes;
+        self.drop.registered = true;
         if (!continuation) list.clearRetainingCapacity();
 
         // Matching kitty, an over-cap chunk is dropped and does not
@@ -469,6 +572,287 @@ pub const State = struct {
         try list.appendSlice(alloc, payload);
 
         return if (more) null else .registration;
+    }
+
+    fn enableSource(self: *State, alloc: Allocator, client_id: u32) void {
+        self.source.resetOffer(alloc);
+        self.source.enabled = true;
+        self.source.client_id = client_id;
+    }
+
+    fn disableSource(self: *State, alloc: Allocator) void {
+        self.source.resetOffer(alloc);
+        self.source.enabled = false;
+        self.source.client_id = 0;
+    }
+
+    pub fn sourceEnabled(self: *const State) bool {
+        return self.source.enabled;
+    }
+
+    pub fn requestDrag(
+        self: *State,
+        writer: *std.Io.Writer,
+        ev: MoveEvent,
+    ) std.Io.Writer.Error!bool {
+        if (!self.source.enabled or self.source.phase != .idle) return false;
+        var header_buf: [96]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "t=o:x={d}:y={d}:X={d}:Y={d}", .{
+            ev.cell_x,
+            ev.cell_y,
+            ev.pixel_x,
+            ev.pixel_y,
+        }) catch unreachable;
+        try response.encode(writer, header, self.source.client_id, "", .plain, .st);
+        self.source.phase = .requested;
+        return true;
+    }
+
+    pub fn cancelDragRequest(self: *State, alloc: Allocator) void {
+        if (self.source.phase != .started) self.source.resetOffer(alloc);
+    }
+
+    fn acceptSourceOffer(
+        self: *State,
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        meta: Metadata,
+        payload: []const u8,
+        continuation: bool,
+        terminator: osc.Terminator,
+    ) (Allocator.Error || std.Io.Writer.Error)!?Event {
+        if (!self.source.enabled or self.source.phase != .requested) {
+            try dragError(writer, self.source.client_id, .EPERM, "drag gesture is no longer active", terminator);
+            return null;
+        }
+        if (!continuation) {
+            self.source.mime_list.clearRetainingCapacity();
+            self.source.operations = .{
+                .copy = meta.operation & 1 != 0,
+                .move = meta.operation & 2 != 0,
+            };
+        }
+        if (self.source.mime_list.items.len + payload.len > max_mime_list_bytes) {
+            try dragError(writer, self.source.client_id, .EFBIG, "drag MIME list is too large", terminator);
+            self.source.resetOffer(alloc);
+            return null;
+        }
+        try self.source.mime_list.appendSlice(alloc, payload);
+        if (meta.more) return null;
+        if (!self.source.operations.copy and !self.source.operations.move) {
+            try dragError(writer, self.source.client_id, .EINVAL, "drag offer has no supported action", terminator);
+            self.source.resetOffer(alloc);
+            return null;
+        }
+
+        var count: usize = 0;
+        var names = std.mem.tokenizeScalar(u8, self.source.mime_list.items, ' ');
+        while (names.next()) |_| count += 1;
+        if (count == 0 or count > max_source_mimes) {
+            try dragError(writer, self.source.client_id, .EFBIG, "drag MIME list has too many entries", terminator);
+            self.source.resetOffer(alloc);
+            return null;
+        }
+        try self.source.mimes.ensureTotalCapacity(alloc, count);
+        names = std.mem.tokenizeScalar(u8, self.source.mime_list.items, ' ');
+        while (names.next()) |name| {
+            const copy = try alloc.dupe(u8, name);
+            self.source.mimes.appendAssumeCapacity(.{ .name = copy });
+        }
+        self.source.phase = .offered;
+        return .source_offer;
+    }
+
+    fn acceptSourceData(
+        self: *State,
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        meta: Metadata,
+        payload: []const u8,
+        _: bool,
+        requested: bool,
+        terminator: osc.Terminator,
+    ) (Allocator.Error || std.Io.Writer.Error)!?Event {
+        const phase_ok = if (requested) self.source.phase == .started else self.source.phase == .offered;
+        const raw_index = if (requested) meta.cell_y else meta.cell_x;
+        if (!phase_ok) {
+            try dragError(writer, self.source.client_id, .EINVAL, "invalid drag data response", terminator);
+            self.source.resetOffer(alloc);
+            return null;
+        }
+        if (!requested and raw_index < 0) return null;
+        if (raw_index < 0 or @as(usize, @intCast(raw_index)) >= self.source.mimes.items.len) {
+            try dragError(writer, self.source.client_id, .EINVAL, "invalid drag data response", terminator);
+            self.source.resetOffer(alloc);
+            return null;
+        }
+        const index: usize = @intCast(raw_index);
+        const mime = &self.source.mimes.items[index];
+        if (requested and !mime.requested) {
+            try dragError(writer, self.source.client_id, .EINVAL, "unexpected drag data response", terminator);
+            self.source.resetOffer(alloc);
+            return null;
+        }
+        if (payload.len > 0) {
+            if (!mime.receiving) {
+                self.source.total_data_bytes -= mime.data.items.len;
+                mime.data.clearRetainingCapacity();
+                mime.complete = false;
+                mime.receiving = true;
+            }
+            const decoder = if (std.mem.endsWith(u8, payload, "="))
+                std.base64.standard.Decoder
+            else
+                std.base64.standard_no_pad.Decoder;
+            const decoded_len = decoder.calcSizeForSlice(payload) catch {
+                try dragError(writer, self.source.client_id, .EINVAL, "drag data is not valid base64", terminator);
+                self.source.resetOffer(alloc);
+                return null;
+            };
+            if (decoded_len > max_source_data_bytes -| self.source.total_data_bytes) {
+                try dragError(writer, self.source.client_id, .EFBIG, "drag data is too large", terminator);
+                self.source.resetOffer(alloc);
+                return null;
+            }
+            const start = mime.data.items.len;
+            try mime.data.resize(alloc, start + decoded_len);
+            decoder.decode(mime.data.items[start..], payload) catch {
+                mime.data.items.len = start;
+                try dragError(writer, self.source.client_id, .EINVAL, "drag data is not valid base64", terminator);
+                self.source.resetOffer(alloc);
+                return null;
+            };
+            self.source.total_data_bytes += decoded_len;
+            return null;
+        }
+        if (meta.more) return null;
+        if (!mime.receiving) {
+            self.source.total_data_bytes -= mime.data.items.len;
+            mime.data.clearRetainingCapacity();
+        }
+        mime.complete = true;
+        mime.receiving = false;
+        mime.requested = false;
+        self.source.ready_index = index;
+        return if (requested) .source_data else null;
+    }
+
+    fn requestSourceStart(
+        self: *State,
+        writer: *std.Io.Writer,
+        terminator: osc.Terminator,
+    ) std.Io.Writer.Error!?Event {
+        if (self.source.phase != .offered) {
+            try dragError(writer, self.source.client_id, .EPERM, "drag gesture is no longer active", terminator);
+            return null;
+        }
+        return .source_start;
+    }
+
+    pub fn sourceStartResult(
+        self: *State,
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        started: bool,
+    ) std.Io.Writer.Error!void {
+        if (started) {
+            self.source.phase = .started;
+            try dragError(writer, self.source.client_id, .OK, "", .st);
+        } else {
+            defer self.source.resetOffer(alloc);
+            try dragError(writer, self.source.client_id, .EPERM, "drag could not be started", .st);
+        }
+    }
+
+    fn acceptSourceError(
+        self: *State,
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        meta: Metadata,
+        terminator: osc.Terminator,
+    ) std.Io.Writer.Error!?Event {
+        if (meta.cell_y == -1) {
+            self.source.resetOffer(alloc);
+            return .source_cancel;
+        }
+        if (self.source.phase != .started) {
+            try dragError(writer, self.source.client_id, .EINVAL, "drag has not started", terminator);
+            self.source.resetOffer(alloc);
+            return null;
+        }
+        if (meta.cell_y < 0 or @as(usize, @intCast(meta.cell_y)) >= self.source.mimes.items.len) return null;
+        const index: usize = @intCast(meta.cell_y);
+        const mime = &self.source.mimes.items[index];
+        if (!mime.requested) return null;
+        self.source.total_data_bytes -= mime.data.items.len;
+        mime.data.clearRetainingCapacity();
+        mime.complete = false;
+        mime.receiving = false;
+        mime.requested = false;
+        self.source.ready_index = index;
+        return .source_data_error;
+    }
+
+    pub fn sourceOffer(self: *const State) ?SourceOffer {
+        if (self.source.phase != .offered) return null;
+        return .{ .operations = self.source.operations, .mime_count = self.source.mimes.items.len };
+    }
+
+    pub fn sourceMime(self: *const State, index: usize) ?[]const u8 {
+        if (index >= self.source.mimes.items.len) return null;
+        return self.source.mimes.items[index].name;
+    }
+
+    pub fn sourceData(self: *const State, index: usize) ?[]const u8 {
+        if (index >= self.source.mimes.items.len or !self.source.mimes.items[index].complete) return null;
+        return self.source.mimes.items[index].data.items;
+    }
+
+    pub fn sourceReadyIndex(self: *const State) ?usize {
+        return self.source.ready_index;
+    }
+
+    pub fn requestSourceData(
+        self: *State,
+        writer: *std.Io.Writer,
+        index: usize,
+    ) std.Io.Writer.Error!bool {
+        if (self.source.phase != .started or index >= self.source.mimes.items.len) return false;
+        if (self.source.mimes.items[index].complete) {
+            self.source.ready_index = index;
+            return false;
+        }
+        if (self.source.mimes.items[index].requested) return true;
+        var header_buf: [48]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "t=e:x=5:y={d}", .{index}) catch unreachable;
+        try response.encode(writer, header, self.source.client_id, "", .plain, .st);
+        self.source.mimes.items[index].requested = true;
+        return true;
+    }
+
+    pub fn sourceTarget(self: *State, writer: *std.Io.Writer, index: ?usize) std.Io.Writer.Error!void {
+        if (self.source.phase != .started) return;
+        const target: isize = if (index) |value| @intCast(value) else -1;
+        var header_buf: [48]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "t=e:x=1:y={d}", .{target}) catch unreachable;
+        try response.encode(writer, header, self.source.client_id, "", .plain, .st);
+    }
+
+    pub fn sourceAction(self: *State, writer: *std.Io.Writer, operation: Operation) std.Io.Writer.Error!void {
+        if (self.source.phase != .started) return;
+        var header_buf: [32]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, "t=e:x=2:o={d}", .{@intFromEnum(operation)}) catch unreachable;
+        try response.encode(writer, header, self.source.client_id, "", .plain, .st);
+    }
+
+    pub fn sourceDropped(self: *State, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.source.phase == .started) try response.encode(writer, "t=e:x=3", self.source.client_id, "", .plain, .st);
+    }
+
+    pub fn sourceFinished(self: *State, alloc: Allocator, writer: *std.Io.Writer, cancelled: bool) std.Io.Writer.Error!void {
+        if (self.source.phase != .started) return;
+        defer self.source.resetOffer(alloc);
+        try response.encode(writer, if (cancelled) "t=e:x=4:y=1" else "t=e:x=4:y=0", self.source.client_id, "", .plain, .st);
     }
 
     /// The client's acceptance response for the drag currently over the
