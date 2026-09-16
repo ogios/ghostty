@@ -424,29 +424,150 @@ test "dnd: remote transfer requests refused" {
     );
 }
 
-test "dnd: drag out refused" {
+test "dnd: drag source pre-sent data round trip" {
     var h: Harness = .init();
     defer h.deinit();
 
-    // Enabling and disabling offers is accepted silently and allocates
-    // nothing.
-    _ = try h.command("t=o:x=1", null);
-    _ = try h.command("t=o:x=2", null);
-    try h.expectOutput("");
+    try testing.expectEqual(dnd.Event.source_registration, (try h.command("t=o:x=1:i=9", null)).?);
+    try testing.expect(h.registered().sourceEnabled());
+    try testing.expect(!h.registered().dropRegistered());
+
+    try testing.expect(try h.registered().requestDrag(&h.output.writer, .{
+        .cell_x = 2,
+        .cell_y = 3,
+        .pixel_x = 20,
+        .pixel_y = 30,
+        .operations = .{},
+    }));
+    try h.expectOutput("\x1b]72;t=o:x=2:y=3:X=20:Y=30:i=9\x1b\\");
+
+    try testing.expect((try h.command("t=o:o=3:m=1", "text/plain text/")) == null);
+    try testing.expectEqual(dnd.Event.source_offer, (try h.command("t=q:m=0", "uri-list")).?);
+    const offer = h.registered().sourceOffer().?;
+    try testing.expect(offer.operations.copy and offer.operations.move);
+    try testing.expectEqual(@as(usize, 2), offer.mime_count);
+    try testing.expectEqualStrings("text/plain", h.registered().sourceMime(0).?);
+    try testing.expectEqualStrings("text/uri-list", h.registered().sourceMime(1).?);
+
+    _ = try h.command("t=p:x=0:m=1", "aGVs");
+    _ = try h.command("t=q:m=0", "bG8=");
+    _ = try h.command("t=p:x=0", "");
+    try testing.expectEqualStrings("hello", h.registered().sourceData(0).?);
+
+    try testing.expectEqual(dnd.Event.source_start, (try h.command("t=P:x=-1", null)).?);
+    try h.registered().sourceStartResult(testing.allocator, &h.output.writer, true);
+    try h.expectOutput("\x1b]72;t=E:i=9:m=0;OK\x1b\\");
+
+    try h.registered().sourceTarget(&h.output.writer, 1);
+    try h.registered().sourceAction(&h.output.writer, .copy);
+    try h.registered().sourceDropped(&h.output.writer);
+    try h.expectOutput(
+        "\x1b]72;t=e:x=1:y=1:i=9\x1b\\" ++
+            "\x1b]72;t=e:x=2:o=1:i=9\x1b\\" ++
+            "\x1b]72;t=e:x=3:i=9\x1b\\",
+    );
+
+    try h.registered().sourceFinished(testing.allocator, &h.output.writer, false);
+    try h.expectOutput("\x1b]72;t=e:x=4:y=0:i=9\x1b\\");
+    try testing.expect(h.registered().sourceEnabled());
+
+    try testing.expectEqual(dnd.Event.source_registration, (try h.command("t=o:x=2", null)).?);
     try testing.expect(h.state == null);
+}
 
-    // Offering a drag is refused.
-    _ = try h.command("t=o:x=1", null);
-    _ = try h.command("t=o:o=3", "text/plain");
-    try h.expectOutput(
-        "\x1b]72;t=E:m=0;EPERM:drag out is not supported by this terminal\x1b\\",
-    );
+test "dnd: drag source on-demand data and errors" {
+    var h: Harness = .init();
+    defer h.deinit();
 
-    // Starting a drag is refused, echoing the command's client id.
-    _ = try h.command("t=P:x=-1:i=9", null);
+    _ = try h.command("t=o:x=1:i=4", null);
+    _ = try h.registered().requestDrag(&h.output.writer, .{
+        .cell_x = 0,
+        .cell_y = 0,
+        .pixel_x = 0,
+        .pixel_y = 0,
+        .operations = .{},
+    });
+    h.clear();
+    _ = try h.command("t=o:o=1", "text/plain text/uri-list");
+    try testing.expectEqual(dnd.Event.source_start, (try h.command("t=P:x=-1", null)).?);
+    try h.registered().sourceStartResult(testing.allocator, &h.output.writer, true);
+    h.clear();
+
+    try testing.expect(try h.registered().requestSourceData(&h.output.writer, 0));
+    try testing.expect(try h.registered().requestSourceData(&h.output.writer, 1));
     try h.expectOutput(
-        "\x1b]72;t=E:i=9:m=0;EPERM:drag out is not supported by this terminal\x1b\\",
+        "\x1b]72;t=e:x=5:y=0:i=4\x1b\\" ++
+            "\x1b]72;t=e:x=5:y=1:i=4\x1b\\",
     );
+    _ = try h.command("t=e:y=1:m=0", "ZmlsZTovLy90bXAvYS50eHQNCg==");
+    try testing.expectEqual(dnd.Event.source_data, (try h.command("t=e:y=1", "")).?);
+    try testing.expectEqual(@as(?usize, 1), h.registered().sourceReadyIndex());
+    try testing.expectEqualStrings("file:///tmp/a.txt\r\n", h.registered().sourceData(1).?);
+    try testing.expectEqual(dnd.Event.source_data_error, (try h.command("t=E:y=0", "EIO")).?);
+    try testing.expectEqual(@as(?usize, 0), h.registered().sourceReadyIndex());
+
+    try h.registered().sourceFinished(testing.allocator, &h.output.writer, true);
+    try h.expectOutput("\x1b]72;t=e:x=4:y=1:i=4\x1b\\");
+
+    _ = try h.registered().requestDrag(&h.output.writer, .{
+        .cell_x = 0,
+        .cell_y = 0,
+        .pixel_x = 0,
+        .pixel_y = 0,
+        .operations = .{},
+    });
+    h.clear();
+    _ = try h.command("t=o:o=1", "text/plain");
+    _ = try h.command("t=p:x=0", "not-base64");
+    try h.expectOutput("\x1b]72;t=E:i=4:m=0;EINVAL:drag data is not valid base64\x1b\\");
+    try testing.expect(h.registered().sourceOffer() == null);
+}
+
+test "dnd: released gesture rejects a late offer" {
+    var h: Harness = .init();
+    defer h.deinit();
+
+    _ = try h.command("t=o:x=1:i=6", null);
+    _ = try h.registered().requestDrag(&h.output.writer, .{
+        .cell_x = 0,
+        .cell_y = 0,
+        .pixel_x = 0,
+        .pixel_y = 0,
+        .operations = .{},
+    });
+    h.clear();
+    h.registered().cancelDragRequest(testing.allocator);
+    _ = try h.command("t=o:o=1", "text/plain");
+    try h.expectOutput("\x1b]72;t=E:i=6:m=0;EPERM:drag gesture is no longer active\x1b\\");
+
+    _ = try h.registered().requestDrag(&h.output.writer, .{
+        .cell_x = 0,
+        .cell_y = 0,
+        .pixel_x = 0,
+        .pixel_y = 0,
+        .operations = .{},
+    });
+    h.clear();
+    _ = try h.command("t=o:o=1", "text/plain");
+    _ = try h.command("t=E:y=0", "EIO");
+    try h.expectOutput("\x1b]72;t=E:i=6:m=0;EINVAL:drag has not started\x1b\\");
+}
+
+test "dnd: drag source and drop target registrations coexist" {
+    var h: Harness = .init();
+    defer h.deinit();
+
+    _ = try h.command("t=a:i=2", "text/plain");
+    _ = try h.command("t=o:x=1:i=3", null);
+    try testing.expect(h.registered().dropRegistered());
+    try testing.expect(h.registered().sourceEnabled());
+
+    _ = try h.command("t=A", null);
+    try testing.expect(h.state != null);
+    try testing.expect(!h.registered().dropRegistered());
+    try testing.expect(h.registered().sourceEnabled());
+
+    _ = try h.command("t=o:x=2", null);
     try testing.expect(h.state == null);
 }
 
