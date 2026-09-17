@@ -19,6 +19,7 @@ const log = std.log.scoped(.kitty_dnd);
 pub const max_mime_list_bytes = 1024 * 1024;
 pub const max_source_mimes = 256;
 pub const max_source_data_bytes = 64 * 1024 * 1024;
+pub const max_source_images = 16;
 
 /// Process one OSC 72 command received from the client, writing any
 /// responses to the writer. Returns the state change the embedder may
@@ -136,6 +137,7 @@ pub fn handleCommand(
                 return null;
             };
             if (meta.cell_x == -1) return try state.requestSourceStart(writer, v.terminator);
+            return state.selectSourceImage(meta.cell_x);
         },
 
         .drag_event => {
@@ -306,6 +308,9 @@ pub const Event = enum {
     source_registration,
     source_offer,
     source_start,
+    /// The drag image changed mid-drag (t=P:x=idx >= 0). The embedder
+    /// reads `selectedSourceImage` to refresh the native drag icon.
+    source_image,
     source_data,
     source_data_error,
     source_cancel,
@@ -417,6 +422,12 @@ pub const State = struct {
         operations: Operations = .{},
         mime_list: std.ArrayListUnmanaged(u8) = .empty,
         mimes: std.ArrayListUnmanaged(Mime) = .empty,
+        /// Drag images transmitted with t=p negative indices, in order
+        /// (-1 first). The first image is the default for the drag.
+        images: std.ArrayListUnmanaged(Image) = .empty,
+        /// Index into `images` currently backing the native drag icon,
+        /// or null when the drag has no image.
+        selected_image: ?usize = null,
         ready_index: ?usize = null,
         total_data_bytes: usize = 0,
 
@@ -431,6 +442,16 @@ pub const State = struct {
             receiving: bool = false,
         };
 
+        const Image = struct {
+            format: DragImageFormat = .text,
+            size_x: u32 = 0,
+            size_y: u32 = 0,
+            opacity: u32 = 0,
+            data: std.ArrayListUnmanaged(u8) = .empty,
+            complete: bool = false,
+            receiving: bool = false,
+        };
+
         fn resetOffer(self: *DragSource, alloc: Allocator) void {
             for (self.mimes.items) |*mime| {
                 alloc.free(mime.name);
@@ -438,6 +459,10 @@ pub const State = struct {
             }
             self.mimes.deinit(alloc);
             self.mimes = .empty;
+            for (self.images.items) |*image| image.data.deinit(alloc);
+            self.images.deinit(alloc);
+            self.images = .empty;
+            self.selected_image = null;
             self.mime_list.clearAndFree(alloc);
             self.phase = .idle;
             self.operations = .{};
@@ -453,6 +478,34 @@ pub const State = struct {
     pub const SourceOffer = struct {
         operations: Operations,
         mime_count: usize,
+    };
+
+    /// The pixel format of a drag image (the `y` key of a t=p command).
+    pub const DragImageFormat = enum {
+        /// UTF-8 text the terminal renders itself.
+        text,
+        /// 24-bit RGB samples.
+        rgb,
+        /// 32-bit RGBA samples.
+        rgba,
+        /// A PNG stream.
+        png,
+    };
+
+    /// A drag image the client attached to the offered drag. `data` is
+    /// the decoded payload, borrowed from the state and valid until the
+    /// offer is reset.
+    pub const DragImage = struct {
+        format: DragImageFormat,
+        /// Text: scale numerator of the base font size (X). Bitmaps:
+        /// pixel width.
+        size_x: u32,
+        /// Text: scale denominator of the base font size (Y). Bitmaps:
+        /// pixel height.
+        size_y: u32,
+        /// Text background opacity, 0..1024 (0 = transparent).
+        opacity: u32,
+        data: []const u8,
     };
 
     /// One dropped representation: a MIME type and its data.
@@ -680,7 +733,9 @@ pub const State = struct {
             self.source.resetOffer(alloc);
             return null;
         }
-        if (!requested and raw_index < 0) return null;
+        if (!requested and raw_index < 0) {
+            return try self.acceptSourceImage(alloc, writer, meta, payload, terminator);
+        }
         if (raw_index < 0 or @as(usize, @intCast(raw_index)) >= self.source.mimes.items.len) {
             try dragError(writer, self.source.client_id, .EINVAL, "invalid drag data response", terminator);
             self.source.resetOffer(alloc);
@@ -737,6 +792,111 @@ pub const State = struct {
         return if (requested) .source_data else null;
     }
 
+    /// Accept one t=p drag-image chunk. Images arrive as negative `x`
+    /// indices (-1 for the first) and are stored in order so the
+    /// embedder can render the selected one as the native drag icon.
+    fn acceptSourceImage(
+        self: *State,
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        meta: Metadata,
+        payload: []const u8,
+        terminator: osc.Terminator,
+    ) (Allocator.Error || std.Io.Writer.Error)!?Event {
+        const index: usize = @intCast(-@as(i64, meta.cell_x) - 1);
+        if (index >= max_source_images) {
+            try dragError(writer, self.source.client_id, .EFBIG, "too many drag images", terminator);
+            self.source.resetOffer(alloc);
+            return null;
+        }
+        if (index > self.source.images.items.len) {
+            try dragError(writer, self.source.client_id, .EINVAL, "drag image indices must be consecutive", terminator);
+            self.source.resetOffer(alloc);
+            return null;
+        }
+        if (index == self.source.images.items.len) {
+            try self.source.images.append(alloc, .{});
+        }
+        const image = &self.source.images.items[index];
+
+        const format: DragImageFormat = switch (meta.cell_y) {
+            0 => .text,
+            24 => .rgb,
+            32 => .rgba,
+            100 => .png,
+            else => {
+                try dragError(writer, self.source.client_id, .EINVAL, "unsupported drag image format", terminator);
+                self.source.resetOffer(alloc);
+                return null;
+            },
+        };
+        const size_x: u32 = @intCast(@max(meta.pixel_x, 0));
+        const size_y: u32 = @intCast(@max(meta.pixel_y, 0));
+        const opacity: u32 = @min(meta.operation, 1024);
+
+        if (payload.len > 0) {
+            if (!image.receiving) {
+                self.source.total_data_bytes -= image.data.items.len;
+                image.data.clearRetainingCapacity();
+                image.format = format;
+                image.size_x = size_x;
+                image.size_y = size_y;
+                image.opacity = opacity;
+                image.complete = false;
+                image.receiving = true;
+            }
+            const decoder = if (std.mem.endsWith(u8, payload, "="))
+                std.base64.standard.Decoder
+            else
+                std.base64.standard_no_pad.Decoder;
+            const decoded_len = decoder.calcSizeForSlice(payload) catch {
+                try dragError(writer, self.source.client_id, .EINVAL, "drag image is not valid base64", terminator);
+                self.source.resetOffer(alloc);
+                return null;
+            };
+            if (decoded_len > max_source_data_bytes -| self.source.total_data_bytes) {
+                try dragError(writer, self.source.client_id, .EFBIG, "drag image data is too large", terminator);
+                self.source.resetOffer(alloc);
+                return null;
+            }
+            const start = image.data.items.len;
+            try image.data.resize(alloc, start + decoded_len);
+            decoder.decode(image.data.items[start..], payload) catch {
+                image.data.items.len = start;
+                try dragError(writer, self.source.client_id, .EINVAL, "drag image is not valid base64", terminator);
+                self.source.resetOffer(alloc);
+                return null;
+            };
+            self.source.total_data_bytes += decoded_len;
+            return null;
+        }
+        if (meta.more) return null;
+        if (!image.receiving) {
+            self.source.total_data_bytes -= image.data.items.len;
+            image.data.clearRetainingCapacity();
+            image.format = format;
+            image.size_x = size_x;
+            image.size_y = size_y;
+            image.opacity = opacity;
+        }
+        image.complete = true;
+        image.receiving = false;
+        return null;
+    }
+
+    /// Handle a mid-drag t=P:x=idx image switch. An out-of-range index
+    /// removes the icon, matching the spec.
+    fn selectSourceImage(self: *State, index: i32) ?Event {
+        if (self.source.phase != .started) return null;
+        const selected: ?usize = if (index >= 0 and @as(usize, @intCast(index)) < self.source.images.items.len)
+            @intCast(index)
+        else
+            null;
+        if (self.source.selected_image == selected) return null;
+        self.source.selected_image = selected;
+        return .source_image;
+    }
+
     fn requestSourceStart(
         self: *State,
         writer: *std.Io.Writer,
@@ -746,6 +906,8 @@ pub const State = struct {
             try dragError(writer, self.source.client_id, .EPERM, "drag gesture is no longer active", terminator);
             return null;
         }
+        // The first image, when the client sent any, is the default icon.
+        self.source.selected_image = if (self.source.images.items.len > 0) 0 else null;
         return .source_start;
     }
 
@@ -810,6 +972,33 @@ pub const State = struct {
 
     pub fn sourceReadyIndex(self: *const State) ?usize {
         return self.source.ready_index;
+    }
+
+    /// The number of drag images the client pre-sent for the current
+    /// offer.
+    pub fn sourceImageCount(self: *const State) usize {
+        return self.source.images.items.len;
+    }
+
+    /// The drag image at `index`, or null when out of range. The data is
+    /// borrowed from the state.
+    pub fn sourceImage(self: *const State, index: usize) ?DragImage {
+        if (index >= self.source.images.items.len) return null;
+        const image = &self.source.images.items[index];
+        return .{
+            .format = image.format,
+            .size_x = image.size_x,
+            .size_y = image.size_y,
+            .opacity = image.opacity,
+            .data = image.data.items,
+        };
+    }
+
+    /// The drag image backing the native drag icon, or null when none is
+    /// selected. Borrowed from the state.
+    pub fn selectedSourceImage(self: *const State) ?DragImage {
+        const index = self.source.selected_image orelse return null;
+        return self.sourceImage(index);
     }
 
     pub fn requestSourceData(

@@ -51,9 +51,12 @@ pub const encodeError = dnd_response.encodeError;
 pub const State = dnd_drop.State;
 pub const Item = dnd_drop.State.Item;
 pub const MoveEvent = dnd_drop.State.MoveEvent;
+pub const DragImage = dnd_drop.State.DragImage;
+pub const DragImageFormat = dnd_drop.State.DragImageFormat;
 pub const max_mime_list_bytes = dnd_drop.max_mime_list_bytes;
 pub const max_source_mimes = dnd_drop.max_source_mimes;
 pub const max_source_data_bytes = dnd_drop.max_source_data_bytes;
+pub const max_source_images = dnd_drop.max_source_images;
 pub const handleCommand = dnd_drop.handleCommand;
 pub const Event = dnd_drop.Event;
 

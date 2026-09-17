@@ -475,7 +475,7 @@ test "dnd: drag source pre-sent data round trip" {
     try testing.expect(h.state == null);
 }
 
-test "dnd: unsupported drag icon does not cancel source" {
+test "dnd: drag image is captured and selected for the drag icon" {
     var h: Harness = .init();
     defer h.deinit();
 
@@ -492,8 +492,56 @@ test "dnd: unsupported drag icon does not cancel source" {
     _ = try h.command("t=p:x=0", "aGVsbG8");
     _ = try h.command("t=p:x=0", "");
     try testing.expectEqualStrings("hello", h.registered().sourceData(0).?);
+
+    // A yazi-style text drag image (format 0, 6x4 scale, transparent).
     _ = try h.command("t=p:x=-1:y=0:X=6:Y=4:o=0", "MSBzZWxlY3RlZCBmaWxlKHMp");
+    try testing.expectEqual(@as(usize, 1), h.registered().sourceImageCount());
+    const image = h.registered().sourceImage(0).?;
+    try testing.expectEqual(dnd.DragImageFormat.text, image.format);
+    try testing.expectEqual(@as(u32, 6), image.size_x);
+    try testing.expectEqual(@as(u32, 4), image.size_y);
+    try testing.expectEqual(@as(u32, 0), image.opacity);
+    try testing.expectEqualStrings("1 selected file(s)", image.data);
+
     try testing.expectEqual(dnd.Event.source_start, (try h.command("t=P:x=-1", null)).?);
+    const selected = h.registered().selectedSourceImage().?;
+    try testing.expectEqual(dnd.DragImageFormat.text, selected.format);
+    try testing.expectEqualStrings("1 selected file(s)", selected.data);
+
+    // Starting the native drag, then switching to an out-of-range image
+    // removes the icon and reports the change.
+    try h.registered().sourceStartResult(testing.allocator, &h.output.writer, true);
+    h.clear();
+    try testing.expectEqual(dnd.Event.source_image, (try h.command("t=P:x=1", null)).?);
+    try testing.expect(h.registered().selectedSourceImage() == null);
+    try testing.expect((try h.command("t=P:x=1", null)) == null);
+    try testing.expectEqual(dnd.Event.source_image, (try h.command("t=P:x=0", null)).?);
+    try testing.expectEqualStrings("1 selected file(s)", h.registered().selectedSourceImage().?.data);
+}
+
+test "dnd: PNG drag image accumulates chunked base64" {
+    var h: Harness = .init();
+    defer h.deinit();
+
+    _ = try h.command("t=o:x=1", null);
+    _ = try h.registered().requestDrag(&h.output.writer, .{
+        .cell_x = 0,
+        .cell_y = 0,
+        .pixel_x = 0,
+        .pixel_y = 0,
+        .operations = .{},
+    });
+    h.clear();
+    _ = try h.command("t=o:o=1", "text/uri-list");
+    _ = try h.command("t=p:x=-1:y=100:X=2:Y=2:m=1", "iVBORw0KGgo=");
+    try testing.expectEqual(@as(usize, 8), h.registered().sourceImage(0).?.data.len);
+    _ = try h.command("t=p:m=1", "AAAA");
+    _ = try h.command("t=p:m=0", "");
+    const image = h.registered().sourceImage(0).?;
+    try testing.expectEqual(dnd.DragImageFormat.png, image.format);
+    try testing.expectEqual(@as(u32, 2), image.size_x);
+    try testing.expectEqual(@as(u32, 2), image.size_y);
+    try testing.expectEqual(@as(usize, 11), image.data.len);
 }
 
 test "dnd: drag source on-demand data and errors" {
